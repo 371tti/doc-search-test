@@ -19,12 +19,12 @@ sudachi cli をインストールしといて辞書もぶっこんどいてく�
 2. Sudachi コマンドが必要な場合は `--sudachi CMD` で指定できます。
 3. クエリ検索は `--query "検索文"` または対話モードで実行可能です。
 
-詳細なオプションは `cargo run -- -h` で確認できます。
+詳細なオプションは `cargo run --release -- -h` で確認できます。
 
 ## 例
 
 ```sh
-cargo run -- --docs ./data/ex_docs --query "検索したい文章"
+cargo run --release -- --docs ./data/ex_docs --query "検索したい文章"
 ```
 
 ## 注意
