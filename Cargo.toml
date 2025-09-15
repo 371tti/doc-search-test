@@ -5,6 +5,6 @@ edition = "2024"
 
 [dependencies]
 rayon = "1.11.0"
-serde = "1.0.223"
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_cbor = "0.11.2"
-tf-idf-vectorizer = "0.4.0"
+tf-idf-vectorizer = "0.4.2"

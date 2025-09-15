@@ -1,7 +1,9 @@
 use std::{env, fs, io, path::Path, process::{Command, Stdio}, time::Instant};
 use std::sync::atomic::{AtomicBool, Ordering};
 use rayon::prelude::*;
-use tf_idf_vectorizer::vectorizer::{corpus::Corpus, evaluate::scoring::SimilarityQuery, token::TokenFrequency, TFIDFVectorizer, serde::TFIDFData};
+use tf_idf_vectorizer::vectorizer::{corpus::Corpus, token::TokenFrequency, TFIDFVectorizer, serde::TFIDFData};
+use tf_idf_vectorizer::vectorizer::evaluate::scoring::SimilarityAlgorithm;
+use std::sync::Arc;
 use serde::{Serialize, de::DeserializeOwned};
 
 // Sudachi 側の "Input is too long" エラー (約49149 bytes) を避けるため余裕を持った上限
@@ -411,8 +413,8 @@ fn main() {
 
     let sudachi_cmd = sudachi_cmd_opt.unwrap_or_else(|| detect_sudachi_cmd());
 
-    // --docs オプションが指定されていない場合はエラー
-    if docs_dir.is_empty() {
+    // --docs オプションが指定されていない場合はエラー（--load指定時は無視）
+    if docs_dir.is_empty() && load_base.is_none() {
         eprintln!("[error] --docs オプションが必要です");
         print_usage();
         return;
@@ -420,9 +422,9 @@ fn main() {
 
     // ---- コーパス & インデックス構築 / 読み込み ----
     // create empty corpus first and optionally overwrite from load
-    let mut corpus: Corpus = Corpus::new();
+    let corpus: Arc<Corpus> = Arc::new(Corpus::new());
     // 量子化型 u16 採用
-    let mut vectorizer: TFIDFVectorizer<u16> = TFIDFVectorizer::new(&corpus);
+    let mut vectorizer: TFIDFVectorizer<u16> = TFIDFVectorizer::new(Arc::clone(&corpus));
 
     let load_start = Instant::now();
     if let Some(ref base) = load_base {
@@ -434,8 +436,10 @@ fn main() {
         match (corpus_res, index_res) {
             (Ok(c), Ok(data)) => {
                 // assign outer corpus so it lives long enough
-                corpus = c;
-                vectorizer = data.into_tf_idf_vectorizer(&corpus);
+                let corpus_arc = Arc::new(c);
+                vectorizer = data.into_tf_idf_vectorizer(Arc::clone(&corpus_arc));
+                // corpus変数も更新
+                let corpus = corpus_arc;
                 eprintln!("[info] loaded corpus+index from {} (docs={})", base, vectorizer.documents.len());
                 loaded = true;
             }
@@ -521,8 +525,8 @@ fn run_single_query(sudachi_cmd: &str, vectorizer: &mut TFIDFVectorizer<u16>, qu
     let mut tf = TokenFrequency::new();
     tf.add_tokens(&refs);
     let t3 = Instant::now();
-    let query = SimilarityQuery::BM25(tf, 1.5, 0.75); // BM25 example
-    let mut results = vectorizer.similarity(query);
+    let algorithm = SimilarityAlgorithm::BM25(1.5, 0.75); // BM25 example
+    let mut results = vectorizer.similarity(&tf, &algorithm);
     results.sort_by_score();
     let t4 = Instant::now();
     eprintln!("[query] tokens: {}", tokens.join(" "));
@@ -559,8 +563,8 @@ fn run_interactive(sudachi_cmd: &str, vectorizer: &mut TFIDFVectorizer<u16>) {
         let mut tf = TokenFrequency::new();
         tf.add_tokens(&refs);
         let t3 = Instant::now();
-        let query = SimilarityQuery::BM25(tf, 1.5, 0.75); // BM25 example
-        let mut results = vectorizer.similarity(query);
+        let algorithm = SimilarityAlgorithm::BM25(1.5, 0.75); // BM25 example
+    let mut results = vectorizer.similarity(&tf, &algorithm);
         results.sort_by_score();
         let t4 = Instant::now();
         eprintln!("[query] tokens: {}", tokens.join(" "));
