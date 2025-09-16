@@ -525,7 +525,7 @@ fn run_single_query(sudachi_cmd: &str, vectorizer: &mut TFIDFVectorizer<u16>, qu
     let mut tf = TokenFrequency::new();
     tf.add_tokens(&refs);
     let t3 = Instant::now();
-    let algorithm = SimilarityAlgorithm::BM25(1.5, 0.75); // BM25 example
+    let algorithm = SimilarityAlgorithm::CosineSimilarity; // BM25 example
     let mut results = vectorizer.similarity(&tf, &algorithm);
     results.sort_by_score();
     let t4 = Instant::now();
@@ -563,7 +563,7 @@ fn run_interactive(sudachi_cmd: &str, vectorizer: &mut TFIDFVectorizer<u16>) {
         let mut tf = TokenFrequency::new();
         tf.add_tokens(&refs);
         let t3 = Instant::now();
-        let algorithm = SimilarityAlgorithm::BM25(1.5, 0.75); // BM25 example
+        let algorithm = SimilarityAlgorithm::CosineSimilarity; // BM25 example
     let mut results = vectorizer.similarity(&tf, &algorithm);
         results.sort_by_score();
         let t4 = Instant::now();
