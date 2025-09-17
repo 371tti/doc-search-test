@@ -5,119 +5,7 @@ use tf_idf_vectorizer::vectorizer::{corpus::Corpus, token::TokenFrequency, TFIDF
 use tf_idf_vectorizer::vectorizer::evaluate::scoring::SimilarityAlgorithm;
 use std::sync::Arc;
 use serde::{Serialize, de::DeserializeOwned};
-
-// Sudachi 側の "Input is too long" エラー (約49149 bytes) を避けるため余裕を持った上限
-// 実際の CLI 実装内部バッファに安全マージンをとり 40KB とする
-const SUDACHI_CHUNK_BYTE_LIMIT: usize = 40_000;
-
-// Sudachi が存在しない場合のフォールバックフラグ (一度失敗したら以降 spawn を試さない)
-static SUDACHI_FALLBACK: AtomicBool = AtomicBool::new(false);
-
-// 外部コマンド (Sudachi) を 1 回だけ実行して text をトークン化
-fn sudachi_tokenize_once(cmd: &str, text: &str) -> io::Result<Vec<String>> {
-    if SUDACHI_FALLBACK.load(Ordering::Relaxed) {
-        return Ok(text.split_whitespace().map(|s| s.to_string()).collect());
-    }
-    // Sudachi コマンド起動。存在しない/起動失敗時はフォールバックして空白区切りトークン化
-    let mut child = match Command::new(cmd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("[warn] failed to spawn '{}': {} -> fallback whitespace tokenization (cached)", cmd, e);
-            SUDACHI_FALLBACK.store(true, Ordering::Relaxed);
-            return Ok(text.split_whitespace().map(|s| s.to_string()).collect());
-        }
-    };
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        stdin.write_all(text.as_bytes())?;
-    }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        let stderr_s = String::from_utf8_lossy(&output.stderr);
-        if stderr_s.contains("Input is too long") {
-            // 呼び出し側で再分割戦略をとるためエラー返却
-            return Err(io::Error::new(io::ErrorKind::Other, "sudachi input too long"));
-        }
-        eprintln!("[warn] sudachi command exited with status {:?}: {}", output.status.code(), stderr_s.trim());
-        return Ok(Vec::new());
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut tokens = Vec::new();
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() { continue; }
-        if line == "EOS" { continue; }
-        if let Some(tok) = line.split(|c: char| c == '\t' || c.is_whitespace()).next() {
-            if tok == "EOS" { continue; }
-            if !tok.is_empty() { tokens.push(tok.to_string()); }
-        }
-    }
-    Ok(tokens)
-}
-
-// バイト上限を超える入力を UTF-8 文字境界で安全にチャンクへ分割
-fn split_into_chunks(text: &str, limit: usize) -> Vec<String> {
-    if text.as_bytes().len() <= limit { return vec![text.to_string()]; }
-    let mut chunks = Vec::new();
-    let mut buf = String::with_capacity(limit + 16);
-    for line in text.split_inclusive('\n') { // 改行保持
-        let mut rest = line;
-        while !rest.is_empty() {
-            let remaining = limit - buf.as_bytes().len();
-            if remaining == 0 { // flush
-                chunks.push(std::mem::take(&mut buf));
-                continue;
-            }
-            if rest.as_bytes().len() <= remaining { // 全部入る
-                buf.push_str(rest);
-                rest = "";
-            } else {
-                // 部分だけ入れる。UTF-8 境界でカット
-                // remaining バイト以内最大の char 境界位置を探す
-                let mut cut = 0usize;
-                for (idx, _) in rest.char_indices() { if idx <= remaining { cut = idx; } else { break; } }
-                if cut == 0 { // 1 文字すら入らない -> flush してやり直し (バッファ空のはず)
-                    chunks.push(std::mem::take(&mut buf));
-                    continue;
-                }
-                buf.push_str(&rest[..cut]);
-                rest = &rest[cut..];
-            }
-            if buf.as_bytes().len() >= limit { chunks.push(std::mem::take(&mut buf)); }
-        }
-    }
-    if !buf.is_empty() { chunks.push(buf); }
-    chunks
-}
-
-// 大きな入力をチャンクに分割して順次 Sudachi へ渡す (失敗した場合さらに細分化)
-fn sudachi_tokenize(cmd: &str, text: &str) -> io::Result<Vec<String>> {
-    // まず一次分割
-    let mut chunks = split_into_chunks(text, SUDACHI_CHUNK_BYTE_LIMIT);
-    let mut tokens_all = Vec::new();
-    for chunk in chunks.drain(..) {
-        match sudachi_tokenize_once(cmd, &chunk) {
-            Ok(toks) => tokens_all.extend(toks),
-            Err(e) => {
-                // さらに半分に再分割して再試行 (再帰的)
-                if e.to_string().contains("too long") && chunk.as_bytes().len() > 1024 {
-                    let sub_limit = (chunk.as_bytes().len()/2).clamp(1024, SUDACHI_CHUNK_BYTE_LIMIT-1);
-                    for sub in split_into_chunks(&chunk, sub_limit) {
-                        let subtoks = sudachi_tokenize_once(cmd, &sub).unwrap_or_default();
-                        tokens_all.extend(subtoks);
-                    }
-                } else {
-                    eprintln!("[warn] sudachi tokenize chunk failed: {} (skipped {} bytes)", e, chunk.len());
-                }
-            }
-        }
-    }
-    Ok(tokens_all)
-}
+pub mod parse;
 
 fn detect_sudachi_cmd() -> String {
     if let Ok(cmd) = env::var("SUDACHI_CMD") { return cmd; }
@@ -151,7 +39,7 @@ fn load_documents_parallel<P: AsRef<Path>>(dir: P, cmd: &str, _corpus: &Corpus, 
     files.par_iter().for_each_with(tx.clone(), |tx, path| {
         let content = fs::read_to_string(path).unwrap_or_default();
     if content.trim().is_empty() { let _ = tx.send(None); return; }
-        let tokens = match sudachi_tokenize(cmd, &content) {
+        let tokens = match crate::parse::sudachi_tokenize_large(&content, crate::parse::SudachiMode::A, 40000) {
             Ok(t) => t,
             Err(_) => { let _ = tx.send(None); return; }
         };
@@ -282,7 +170,7 @@ fn load_documents_stream<P: AsRef<Path>>(dir: P, cmd: &str, _corpus: &Corpus, ve
                 let file_size = fs::metadata(&path).ok().map(|m| m.len()).unwrap_or(0);
                 let content = fs::read_to_string(&path).unwrap_or_default();
                 if content.trim().is_empty() { let _ = res_tx.send(None); continue; }
-                let tokens = match sudachi_tokenize(&cmd, &content) { Ok(t) => t, Err(_) => { let _ = res_tx.send(None); continue; } };
+                let tokens = match crate::parse::sudachi_tokenize_large(&content, crate::parse::SudachiMode::A, 40000) { Ok(t) => t, Err(_) => { let _ = res_tx.send(None); continue; } };
                 if tokens.is_empty() { let _ = res_tx.send(None); continue; }
                 let token_len = tokens.len();
                 let mut tf = TokenFrequency::new();
@@ -516,7 +404,7 @@ fn run_single_query(sudachi_cmd: &str, vectorizer: &mut TFIDFVectorizer<u16>, qu
     let q = query_text.trim();
     if q.is_empty() { eprintln!("[error] empty query"); return; }
     let t0 = Instant::now();
-    let tokens = sudachi_tokenize(sudachi_cmd, q).unwrap_or_default();
+    let tokens = crate::parse::sudachi_tokenize_large(q, crate::parse::SudachiMode::A, 40000).unwrap_or_default();
     let tokens: Vec<String> = tokens.into_iter().filter(|t| t != "EOS").collect();
     let t1 = Instant::now();
     if tokens.is_empty() { eprintln!("[warn] no tokens"); return; }
@@ -525,7 +413,7 @@ fn run_single_query(sudachi_cmd: &str, vectorizer: &mut TFIDFVectorizer<u16>, qu
     let mut tf = TokenFrequency::new();
     tf.add_tokens(&refs);
     let t3 = Instant::now();
-    let algorithm = SimilarityAlgorithm::CosineSimilarity; // BM25 example
+    let algorithm = SimilarityAlgorithm::BM25PrfCosineSimilarity(1.5, 0.75, 3, 0.3); // BM25 example
     let mut results = vectorizer.similarity(&tf, &algorithm);
     results.sort_by_score();
     let t4 = Instant::now();
@@ -553,7 +441,7 @@ fn run_interactive(sudachi_cmd: &str, vectorizer: &mut TFIDFVectorizer<u16>) {
             eprintln!("[info] bye");
             break;
         }
-        let tokens = sudachi_tokenize(sudachi_cmd, trimmed).unwrap_or_default();
+    let tokens = crate::parse::sudachi_tokenize_large(trimmed, crate::parse::SudachiMode::A, 40000).unwrap_or_default();
     let tokens: Vec<String> = tokens.into_iter().filter(|t| t != "EOS").collect();
     let start = Instant::now(); // timing baseline for this query
         let t1 = Instant::now();
@@ -563,7 +451,7 @@ fn run_interactive(sudachi_cmd: &str, vectorizer: &mut TFIDFVectorizer<u16>) {
         let mut tf = TokenFrequency::new();
         tf.add_tokens(&refs);
         let t3 = Instant::now();
-        let algorithm = SimilarityAlgorithm::CosineSimilarity; // BM25 example
+        let algorithm = SimilarityAlgorithm::BM25PrfCosineSimilarity(1.5, 0.75, 3, 0.3); // BM25 example
     let mut results = vectorizer.similarity(&tf, &algorithm);
         results.sort_by_score();
         let t4 = Instant::now();
