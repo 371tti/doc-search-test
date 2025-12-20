@@ -1,5 +1,5 @@
 /target
-milion.corpus.cbor
-milion.index.cbor
-1M.index.cbor
-1M.corpus.cbor
+/index
+/wikipedia_all_articles_fast
+/config
+wikipedia_all_articles_fast.7z

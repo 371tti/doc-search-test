@@ -1,496 +1,274 @@
-use std::{env, fs, io, path::Path, process::{Command, Stdio}, time::Instant};
-use std::sync::atomic::{AtomicBool, Ordering};
-use rayon::prelude::*;
-use tf_idf_vectorizer::vectorizer::{corpus::Corpus, token::TokenFrequency, TFIDFVectorizer, serde::TFIDFData};
-use tf_idf_vectorizer::vectorizer::evaluate::scoring::SimilarityAlgorithm;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use serde::{Serialize, de::DeserializeOwned};
-pub mod parse;
+use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-fn detect_sudachi_cmd() -> String {
-    if let Ok(cmd) = env::var("SUDACHI_CMD") { return cmd; }
-    // 単純に既定名
-    "sudachi".to_string()
+use clap::{Parser, Subcommand};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use rayon::prelude::*;
+use tf_idf_vectorizer::{Corpus, Hits, SimilarityAlgorithm, TFIDFData, TFIDFVectorizer, TokenFrequency};
+use walkdir::WalkDir;
+
+use crate::tokenize::SudachiTokenizer;
+
+pub mod tokenize;
+
+type DynError = Box<dyn std::error::Error + Send + Sync>;
+
+#[derive(Parser)]
+#[command(name = "doc-search-test", version, about = "Build/load a TF-IDF index and run searches")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
 }
 
-// 旧: 事前スキャン + Rayon 並列 (総数とETAが出せる)
-fn load_documents_parallel<P: AsRef<Path>>(dir: P, cmd: &str, _corpus: &Corpus, vectorizer: &mut TFIDFVectorizer<u16>, limit: Option<usize>) -> io::Result<usize> {
-    use std::io::Write;
-    let start_all = Instant::now();
-    eprintln!("[stage] scanning directory ...");
-    // 事前に対象ファイル一覧収集 (ディレクトリ内直下のみ)
-    let mut files: Vec<_> = fs::read_dir(&dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_file())
-        .collect();
-    files.sort();
-    let total = files.len();
-    if total == 0 { eprintln!("[warn] no files found in directory"); return Ok(0); }
-    let threads = rayon::current_num_threads();
-    eprintln!("[stage] building TF in parallel (threads={})", threads);
+#[derive(Subcommand)]
+enum Command {
+    /// Build an index from documents under the given path
+    Index {
+        /// Document directory (recursively scanned) or a single file
+        #[arg(long)]
+        docs: PathBuf,
 
-    // 並列処理: 各ファイルを並列にトークン化 + TF 構築 (リアルタイム進捗: mpsc チャネルで逐次通知)
-    use std::sync::mpsc;
-    // bounded channel to provide backpressure and avoid unbounded memory growth
-    let (tx, rx) = mpsc::sync_channel(threads.saturating_mul(4));
-    let spin_frames = ["|","/","-","\\"]; // 簡易スピナー
+        /// Output directory for the index
+        #[arg(long, default_value = "./index")]
+        index: PathBuf,
+    },
 
-    files.par_iter().for_each_with(tx.clone(), |tx, path| {
-        let content = fs::read_to_string(path).unwrap_or_default();
-    if content.trim().is_empty() { let _ = tx.send(None); return; }
-        let tokens = match crate::parse::sudachi_tokenize_large(&content, crate::parse::SudachiMode::A, 40000) {
-            Ok(t) => t,
-            Err(_) => { let _ = tx.send(None); return; }
-        };
-    if tokens.is_empty() { let _ = tx.send(None); return; }
-        let token_len = tokens.len();
-    let mut tf = TokenFrequency::new();
-    let refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
-    tf.add_tokens(&refs);
-    // reduce internal capacity before sending to lower peak memory
-    tf.shrink_to_fit();
-    // free large temporaries (content, tokens) as soon as possible to reduce peak memory
-    drop(tokens);
-    drop(content);
-        let doc_key = path.file_name().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
-        let file_size = fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0);
-    let _ = tx.send(Some((doc_key, tf, token_len, file_size)));
-    });
-    drop(tx); // 送信終了
+    /// Search using an existing index
+    Search {
+        /// Index directory
+        #[arg(long, default_value = "./index")]
+        index: PathBuf,
 
-    let mut count = 0usize;          // 実際に add_doc 済み
-    let mut processed = 0usize;      // 受信したメッセージ数 (スキップ含む)
-    let mut total_tokens: usize = 0; 
-    let mut total_bytes: u64 = 0;    
-    let mut last_refresh = Instant::now();
-    let mut spin_idx = 0usize;
+        /// Query string
+        #[arg(long)]
+        query: String,
 
-    for msg in rx { // 並列完了順で飛んでくる
-        processed += 1;
-        if let Some((doc_key, tf, token_len, file_size)) = msg {
-            vectorizer.add_doc(doc_key, &tf);
-            count += 1;
-            total_tokens += token_len;
-            total_bytes += file_size;
-            if let Some(lim) = limit { if count >= lim { break; } }
-        }
-        // 表示更新
-        let pct = (processed as f64 / total as f64) * 100.0;
-        let elapsed = start_all.elapsed();
-        let elapsed_s = elapsed.as_secs_f64();
-        let docs_per_sec = if elapsed_s > 0.0 { count as f64 / elapsed_s } else { 0.0 };
-        let eta = if count > 0 { (total - processed) as f64 / docs_per_sec.max(1e-9) } else { f64::NAN };
-        if last_refresh.elapsed().as_millis() >= 80 || processed == total {
-            let frame = spin_frames[spin_idx % spin_frames.len()];
-            spin_idx += 1;
-            eprint!(
-                "\r[indexing {}] {}/{} ({:.1}%) processed | added={} | tokens={} | bytes={} | {:.2} docs/s | ETA {:.1}s",
-                frame,
-                processed,
-                total,
-                pct,
-                count,
-                total_tokens,
-                total_bytes,
-                docs_per_sec,
-                eta
-            );
-            let _ = io::stderr().flush();
-            last_refresh = Instant::now();
-        }
-    }
-    eprintln!();
-    let total_elapsed = start_all.elapsed().as_secs_f64();
-    eprintln!(
-        "[done] indexed {} docs (processed {} files) | tokens={} | bytes={} | elapsed {:.2}s | avg {:.2} docs/s", 
-        count, processed, total_tokens, total_bytes, total_elapsed, if total_elapsed>0.0 { count as f64 / total_elapsed } else { 0.0 }
-    );
-    Ok(count)
+        /// Max results to print
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+    },
 }
 
-// (以前のパイプ一括読み取り関数は未使用のため削除)
+fn main() -> Result<(), DynError> {
+    let cli = Cli::parse();
 
-// 新: デフォルト高速ストリーミング (ディレクトリ列挙しつつ即投入 / ワーカ並列 / 総件数未知)
-fn load_documents_stream<P: AsRef<Path>>(dir: P, cmd: &str, _corpus: &Corpus, vectorizer: &mut TFIDFVectorizer<u16>, limit: Option<usize>) -> io::Result<usize> {
-    use std::io::Write;
-    use std::sync::mpsc;
-    let start_all = Instant::now();
-    let spin_frames = ["|","/","-","\\"];
-    let mut spin_idx = 0usize;
-    let workers = rayon::current_num_threads().max(2); // 少なくとも2
-
-    // まず軽量にファイル一覧だけ収集して総数を把握 (サイズ取得等は後で)
-    // 大量ファイル時に無音にならないよう進捗表示
-    eprint!("[scan] collecting file list ...");
-    let mut file_list: Vec<std::path::PathBuf> = Vec::new();
-    let mut scan_count: usize = 0;
-    let mut collected = 0usize;
-    for e in fs::read_dir(&dir)? {
-        if let Ok(e) = e {
-            let p = e.path();
-            if p.is_file() {
-                file_list.push(p);
-                collected += 1;
-                if let Some(lim) = limit { if collected >= lim { scan_count += 1; break; } }
-            }
-            scan_count += 1;
-            if scan_count % 1000 == 0 { eprint!("\r[scan] visited={} files (current kept={})", scan_count, file_list.len()); let _ = io::stderr().flush(); }
+    match cli.command {
+        Command::Index { docs, index } => {
+            build_index(&docs, &index)?;
         }
-        if let Some(lim) = limit { if collected >= lim { break; } }
-    }
-    eprintln!("\r[scan] visited={} files (kept={}) done", scan_count, file_list.len());
-    let total_files_all = file_list.len();
-    if total_files_all == 0 { eprintln!("[warn] no files found in directory"); return Ok(0); }
-    eprintln!("[scan] total_files={} starting workers (limit={:?})", total_files_all, limit);
-    let target_total = limit.map(|l| l.min(total_files_all)).unwrap_or(total_files_all);
-
-    // チャネル: パス送信用 & 結果受信用
-    // bounded channels give backpressure when workers or enumerator are producing faster than consuming
-    let (path_tx, path_rx_raw) = mpsc::sync_channel::<std::path::PathBuf>(workers.saturating_mul(4));
-    let path_rx = std::sync::Arc::new(std::sync::Mutex::new(path_rx_raw));
-    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let (res_tx, res_rx) = mpsc::sync_channel(workers.saturating_mul(4));
-
-    // ワーカースレッド生成
-    for _ in 0..workers {
-        let res_tx = res_tx.clone();
-        let cmd = cmd.to_string();
-        let path_rx_cl = path_rx.clone();
-        let stop_cl = stop_flag.clone();
-        std::thread::spawn(move || {
-            loop {
-                if stop_cl.load(Ordering::Relaxed) { break; }
-                let path = {
-                    let lock = path_rx_cl.lock().unwrap();
-                    lock.recv()
-                };
-                let Ok(path) = path else { break; };
-                let file_size = fs::metadata(&path).ok().map(|m| m.len()).unwrap_or(0);
-                let content = fs::read_to_string(&path).unwrap_or_default();
-                if content.trim().is_empty() { let _ = res_tx.send(None); continue; }
-                let tokens = match crate::parse::sudachi_tokenize_large(&content, crate::parse::SudachiMode::A, 40000) { Ok(t) => t, Err(_) => { let _ = res_tx.send(None); continue; } };
-                if tokens.is_empty() { let _ = res_tx.send(None); continue; }
-                let token_len = tokens.len();
-                let mut tf = TokenFrequency::new();
-                let refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
-                tf.add_tokens(&refs);
-                // reduce internal capacity before sending to lower peak memory
-                tf.shrink_to_fit();
-                // drop large temporaries early to lower peak memory
-                drop(tokens);
-                drop(content);
-                let doc_key = path.file_name().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
-                let _ = res_tx.send(Some((doc_key, tf, token_len, file_size)));
-            }
-        });
-    }
-    // res_tx はワーカーでクローンされているのでここで一旦落とす
-    drop(res_tx);
-
-    // 列挙スレッド (即座にワーカーへ流す)
-    let enum_tx = path_tx.clone();
-    let stop_enum = stop_flag.clone();
-    let enum_handle = std::thread::spawn(move || {
-        let mut sent = 0usize;
-        for p in file_list.into_iter() {
-            if stop_enum.load(Ordering::Relaxed) { break; }
-            if let Some(lim) = limit {
-                if sent >= lim { break; }
-                let _ = enum_tx.send(p.clone()); sent += 1;
-            } else {
-                let _ = enum_tx.send(p); sent += 1;
-            }
-        }
-        // 送信終了 (drop)
-    });
-    drop(path_tx); // メイン側送信クローズ -> 列挙終了後にワーカーへEOFが流れる
-
-    // 進捗集計
-    let mut added_docs = 0usize; // vectorizer.add_doc 済み
-    let mut processed_files = 0usize; // 成功/失敗含む受信件数
-    let mut total_tokens = 0usize;
-    let mut total_bytes: u64 = 0;
-    let mut last_refresh = Instant::now();
-    let mut ewma_rate: f64 = 0.0; // 平滑化した docs/s
-    let alpha = 0.2; // EWMA 係数
-    while let Ok(msg) = res_rx.recv() {
-        processed_files += 1;
-        if let Some((doc_key, tf, token_len, file_size)) = msg {
-            vectorizer.add_doc(doc_key, &tf);
-            added_docs += 1;
-            total_tokens += token_len;
-            total_bytes += file_size;
-            if let Some(lim) = limit { if added_docs >= lim { stop_flag.store(true, Ordering::Relaxed); break; } }
-        }
-        if last_refresh.elapsed().as_millis() >= 120 {
-            let elapsed = start_all.elapsed().as_secs_f64();
-            let frame = spin_frames[spin_idx % spin_frames.len()];
-            spin_idx += 1;
-            let inst_rate = if elapsed > 0.0 { added_docs as f64 / elapsed } else { 0.0 };
-            ewma_rate = if ewma_rate == 0.0 { inst_rate } else { ewma_rate * (1.0 - alpha) + inst_rate * alpha };
-            let remaining = if added_docs >= target_total { 0 } else { target_total - added_docs };
-            let eta = if ewma_rate > 0.0 { remaining as f64 / ewma_rate } else { f64::NAN };
-            eprint!("\r[stream {}] {}/{} added | files_processed={} tokens={} bytes={} rate={:.2} docs/s ETA={:.1}s elapsed {:.1}s", frame, added_docs, target_total, processed_files, total_tokens, total_bytes, ewma_rate, eta, elapsed);
-            let _ = io::stderr().flush();
-            last_refresh = Instant::now();
-        }
-    }
-    // 列挙終了待ち
-    let _ = enum_handle.join();
-    let elapsed = start_all.elapsed().as_secs_f64();
-    let docs_per_sec = if elapsed > 0.0 { added_docs as f64 / elapsed } else { 0.0 };
-    eprintln!("\r[done stream] added={} target={} files_processed={} tokens={} bytes={} elapsed {:.2}s avg {:.2} docs/s        ", added_docs, target_total, processed_files, total_tokens, total_bytes, elapsed, docs_per_sec);
-    Ok(added_docs)
-}
-
-fn main() {
-    let program_start = Instant::now();
-    // ---- 簡易 CLI 引数処理 ----
-    // --docs DIR       : 文書ディレクトリ (デフォ: data/ex_docs)
-    // --sudachi CMD    : Sudachi コマンド (環境変数 SUDACHI_CMD も可)
-    // --query "TEXT"   : クエリ文字列 (未指定なら stdin 全読み込みを試行)
-    // 例)  echo "検索したい文章" | tf-idf-vectorizer
-    //      tf-idf-vectorizer --query "検索したい文章" --docs ./data/ex_docs
-
-    let mut args = env::args().skip(1); // program 名除外
-    let mut docs_dir = String::new();
-    let mut sudachi_cmd_opt: Option<String> = None;
-    let mut query_opt: Option<String> = None;
-    let mut force_parallel = false; // --parallel で旧方式
-    let mut limit_opt: Option<usize> = None; // --limit N
-    let mut save_base: Option<String> = None; // --save name -> name.index.cbor + name.corpus.cbor
-    let mut load_base: Option<String> = None; // --load name -> name.index.cbor + name.corpus.cbor
-    let mut skip_build: bool = false; // --load-index のみで検索 (コーパスは空で良い場合)
-    // true if we successfully loaded both corpus and index from --load
-    let mut loaded = false;
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--docs" => {
-                if let Some(v) = args.next() { docs_dir = v; } else { eprintln!("[error] --docs requires a path"); return; }
-            }
-            "--sudachi" => {
-                if let Some(v) = args.next() { sudachi_cmd_opt = Some(v); } else { eprintln!("[error] --sudachi requires a command name"); return; }
-            }
-            "--query" => {
-                if let Some(v) = args.next() { query_opt = Some(v); } else { eprintln!("[error] --query requires a string"); return; }
-            }
-            "--stream" => { /* 既定でストリームなので何もしない */ }
-            "--parallel" => { force_parallel = true; }
-            "--limit" => {
-                if let Some(v) = args.next() { match v.parse::<usize>() { Ok(n) if n>0 => limit_opt = Some(n), _ => { eprintln!("[error] --limit needs positive integer"); return; } } } else { eprintln!("[error] --limit requires a number"); return; }
-            }
-            "--save" => {
-                if let Some(v) = args.next() { save_base = Some(v); } else { eprintln!("[error] --save requires a name"); return; }
-            }
-            "--load" => {
-                if let Some(v) = args.next() { load_base = Some(v); } else { eprintln!("[error] --load requires a name"); return; }
-            }
-            "--no-indexing" => { skip_build = true; }
-            "-h" | "--help" => {
-                print_usage();
-                return;
-            }
-            other => {
-                // 位置引数をクエリとして解釈 (最初のみ)
-                if query_opt.is_none() { query_opt = Some(other.to_string()); } else { eprintln!("[warn] extra arg ignored: {}", other); }
-            }
+        Command::Search { index, query, top } => {
+            run_search(&index, &query, top)?;
         }
     }
 
-    let sudachi_cmd = sudachi_cmd_opt.unwrap_or_else(|| detect_sudachi_cmd());
-
-    // --docs オプションが指定されていない場合はエラー（--load指定時は無視）
-    if docs_dir.is_empty() && load_base.is_none() {
-        eprintln!("[error] --docs オプションが必要です");
-        print_usage();
-        return;
-    }
-
-    // ---- コーパス & インデックス構築 / 読み込み ----
-    // create empty corpus first and optionally overwrite from load
-    let corpus: Arc<Corpus> = Arc::new(Corpus::new());
-    // 量子化型 u16 採用
-    let mut vectorizer: TFIDFVectorizer<u16> = TFIDFVectorizer::new(Arc::clone(&corpus));
-
-    let load_start = Instant::now();
-    if let Some(ref base) = load_base {
-        let index_path = format!("{}.index.cbor", base);
-        let corpus_path = format!("{}.corpus.cbor", base);
-        // only treat as loaded if both files successfully read
-        let corpus_res = load_cbor::<Corpus>(&corpus_path);
-        let index_res = load_cbor::<TFIDFData<u16, String>>(&index_path);
-        match (corpus_res, index_res) {
-            (Ok(c), Ok(data)) => {
-                // assign outer corpus so it lives long enough
-                let corpus_arc = Arc::new(c);
-                vectorizer = data.into_tf_idf_vectorizer(Arc::clone(&corpus_arc));
-                // corpus変数も更新
-                let corpus = corpus_arc;
-                eprintln!("[info] loaded corpus+index from {} (docs={})", base, vectorizer.documents.len());
-                loaded = true;
-            }
-            (Ok(_), Err(e)) => {
-                eprintln!("[warn] failed to load index {}: {} -> will try full build", index_path, e);
-                if skip_build { return; }
-            }
-            (Err(e), Ok(_)) => {
-                eprintln!("[warn] loaded index but failed to load corpus {}: {} -> will try full build", corpus_path, e);
-                if skip_build { return; }
-            }
-            (Err(e1), Err(e2)) => {
-                eprintln!("[warn] failed to load corpus/index {}: {}, {} -> will try full build", base, e1, e2);
-                if skip_build { return; }
-            }
-        }
-    }
-    if !loaded && !skip_build {
-        let load_res = if force_parallel { load_documents_parallel(&docs_dir, &sudachi_cmd, &corpus, &mut vectorizer, limit_opt) } else { load_documents_stream(&docs_dir, &sudachi_cmd, &corpus, &mut vectorizer, limit_opt) };
-        match load_res {
-            Ok(n) => eprintln!("[info] loaded {} documents (vocab={}) from {}", n, corpus.vocab_size(), docs_dir),
-            Err(e) => { eprintln!("[error] failed to load documents: {}", e); return; }
-        }
-    if vectorizer.documents.is_empty() { eprintln!("[error] no documents loaded. abort"); return; }
-    vectorizer.update_idf();
-        if let Some(ref base) = save_base {
-            let index_path = format!("{}.index.cbor", base);
-            let corpus_path = format!("{}.corpus.cbor", base);
-            if let Err(e) = save_cbor(&index_path, &vectorizer) { eprintln!("[warn] save index failed: {}", e); } else { eprintln!("[info] index saved to {}", index_path); }
-            if let Err(e) = save_cbor(&corpus_path, &corpus) { eprintln!("[warn] save corpus failed: {}", e); } else { eprintln!("[info] corpus saved to {}", corpus_path); }
-        }
-    }
-    let indexing_done = Instant::now();
-    eprintln!("[time] index_total={:.2}ms", indexing_done.duration_since(load_start).as_secs_f64()*1000.0);
-
-    // ---- モード判定: --query 指定時はその1回だけ、未指定なら対話ループ ----
-    if let Some(qtext) = query_opt {
-        run_single_query(&sudachi_cmd, &mut vectorizer, qtext);
-    } else {
-        run_interactive(&sudachi_cmd, &mut vectorizer);
-    }
-
-    eprintln!("[time] program_total={:.2}ms", program_start.elapsed().as_secs_f64()*1000.0);
-}
-
-fn print_usage() {
-    eprintln!("\nUsage: tf-idf-vectorizer --docs DIR [options]\n");
-    eprintln!("必須:");
-    eprintln!("  --docs DIR         文書ディレクトリ (例: ./data/ex_docs)");
-    eprintln!("");
-    eprintln!("オプション:");
-    eprintln!("  --sudachi CMD      Sudachiコマンド名 (デフォルト: 'sudachi'、環境変数SUDACHI_CMDでも指定可)");
-    eprintln!("  --query \"TEXT\"    検索クエリ文字列 (未指定なら対話モード)");
-    eprintln!("  --parallel         インデックス構築を並列モードで実行");
-    eprintln!("  --stream           インデックス構築をストリームモードで実行 (デフォルト)");
-    eprintln!("  --limit N          最大N件まで文書を読み込む");
-    eprintln!("  --save NAME        インデックス/コーパスをNAME.index.cbor/NAME.corpus.cborとして保存");
-    eprintln!("  --load NAME        インデックス/コーパスをNAME.index.cbor/NAME.corpus.cborから読み込み");
-    eprintln!("  --no-indexing      インデックス構築をスキップ (ロードのみ)");
-    eprintln!("  -h, --help         このヘルプを表示");
-    eprintln!("");
-    eprintln!("使用例:");
-    eprintln!("  tf-idf-vectorizer --docs ./data/ex_docs --query \"検索したい文章\"");
-    eprintln!("  echo \"検索したい文章\" | tf-idf-vectorizer --docs ./data/ex_docs");
-    eprintln!("");
-    eprintln!("--query を省略すると対話モードになります。終了するには 'exit' または 'quit' を入力してください。");
-    eprintln!("");
-    eprintln!("出力フォーマット:");
-    eprintln!("  <score>\t<doc_key>    (クエリモード)");
-    eprintln!("  <score>\t\t<doc_len>\t\t<doc_key>    (対話モード 上位20件)");
-}
-
-fn run_single_query(sudachi_cmd: &str, vectorizer: &mut TFIDFVectorizer<u16>, query_text: String) {
-    let q = query_text.trim();
-    if q.is_empty() { eprintln!("[error] empty query"); return; }
-    let t0 = Instant::now();
-    let tokens = crate::parse::sudachi_tokenize_large(q, crate::parse::SudachiMode::A, 40000).unwrap_or_default();
-    let tokens: Vec<String> = tokens.into_iter().filter(|t| t != "EOS").collect();
-    let t1 = Instant::now();
-    if tokens.is_empty() { eprintln!("[warn] no tokens"); return; }
-    let refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
-    let t2 = Instant::now();
-    let mut tf = TokenFrequency::new();
-    tf.add_tokens(&refs);
-    let t3 = Instant::now();
-    let algorithm = SimilarityAlgorithm::BM25PrfCosineSimilarity(1.5, 0.75, 3, 0.3); // BM25 example
-    let mut results = vectorizer.similarity(&tf, &algorithm);
-    results.sort_by_score();
-    let t4 = Instant::now();
-    eprintln!("[query] tokens: {}", tokens.join(" "));
-    eprintln!("[time] tokenize={:.2}ms build_refs={:.2}ms tf_build={:.2}ms score={:.2}ms total={:.2}ms", 
-        t1.duration_since(t0).as_secs_f64()*1000.0,
-        t2.duration_since(t1).as_secs_f64()*1000.0,
-        t3.duration_since(t2).as_secs_f64()*1000.0,
-        t4.duration_since(t3).as_secs_f64()*1000.0,
-        t4.duration_since(t0).as_secs_f64()*1000.0);
-    for (key, score, _) in results.list.iter() { println!("{}\t{}", score, key); }
-}
-
-fn run_interactive(sudachi_cmd: &str, vectorizer: &mut TFIDFVectorizer<u16>) {
-    use std::io::{self, Write};
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    loop {
-        print!("Query> ");
-        let _ = stdout.flush();
-        let mut line = String::new();
-        if stdin.read_line(&mut line).is_err() { eprintln!("[error] read error"); break; }
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
-            eprintln!("[info] bye");
-            break;
-        }
-    let tokens = crate::parse::sudachi_tokenize_large(trimmed, crate::parse::SudachiMode::A, 40000).unwrap_or_default();
-    let tokens: Vec<String> = tokens.into_iter().filter(|t| t != "EOS").collect();
-    let start = Instant::now(); // timing baseline for this query
-        let t1 = Instant::now();
-        if tokens.is_empty() { println!("(no tokens)" ); continue; }
-        let refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
-        let t2 = Instant::now();
-        let mut tf = TokenFrequency::new();
-        tf.add_tokens(&refs);
-        let t3 = Instant::now();
-        let algorithm = SimilarityAlgorithm::BM25PrfCosineSimilarity(1.5, 0.75, 3, 0.3); // BM25 example
-    let mut results = vectorizer.similarity(&tf, &algorithm);
-        results.sort_by_score();
-        let t4 = Instant::now();
-        eprintln!("[query] tokens: {}", tokens.join(" "));
-        eprintln!("[time] tokenize={:.2}ms build_refs={:.2}ms tf_build={:.2}ms score={:.2}ms total={:.2}ms", 
-            t1.duration_since(start).as_secs_f64()*1000.0,
-            t2.duration_since(t1).as_secs_f64()*1000.0,
-            t3.duration_since(t2).as_secs_f64()*1000.0,
-            t4.duration_since(t3).as_secs_f64()*1000.0,
-            t4.duration_since(start).as_secs_f64()*1000.0);
-        for (key, score, doc_len) in results.list.iter().take(20) { // 上位20件
-            println!("{score}\t\t{doc_len}\t\t{key}");
-        }
-    }
-}
-
-// ---- 汎用: CBOR 保存/読込 ----
-fn save_cbor<T: Serialize>(path: &str, value: &T) -> io::Result<()> {
-    use std::io::Write;
-    let tmp = format!("{}.tmp", path);
-    let mut file = fs::File::create(&tmp)?;
-    serde_cbor::to_writer(&mut file, value).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    file.flush()?;
-    #[cfg(unix)]
-    { use std::os::unix::fs::FileExt; file.sync_all()?; }
-    #[cfg(windows)]
-    { file.sync_all()?; }
-    fs::rename(tmp, path)?;
     Ok(())
 }
 
-fn load_cbor<T: DeserializeOwned>(path: &str) -> io::Result<T> {
-    let file = fs::File::open(path)?;
-    match serde_cbor::from_reader(file) {
-        Ok(v) => Ok(v),
-        Err(e) => {
-            let meta = fs::metadata(path).ok();
-            if let Some(m) = meta { eprintln!("[warn] load_cbor failed {}, file_size={}", e, m.len()); }
-            return Err(io::Error::new(io::ErrorKind::Other, e));
+fn build_index(docs_path: &Path, index_dir: &Path) -> Result<(), DynError> {
+    if !docs_path.exists() {
+        return Err(format!("Docs path not found: {}", docs_path.display()).into());
+    }
+    std::fs::create_dir_all(index_dir)?;
+
+    let files = collect_doc_files(docs_path)?;
+    if files.is_empty() {
+        return Err(format!("No files found under: {}", docs_path.display()).into());
+    }
+
+    let mut indexer = DocIndexer::new();
+    let tokenizer = indexer.tokenizer.clone();
+
+    eprintln!("Indexing {} files...", files.len());
+    let started = Instant::now();
+
+    let pb = ProgressBar::new(files.len() as u64);
+    pb.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
+    pb.enable_steady_tick(Duration::from_millis(120));
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({percent}%) {per_sec} ETA {eta_precise}",
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+
+    // Parallel read+tokenize, then add to the vectorizer sequentially.
+    // We increment progress for every attempted file. Non-text / non-UTF8 are skipped
+    // but only summarized at the end to avoid flooding the console.
+    let skipped_non_utf8 = AtomicU64::new(0);
+    let skipped_io = AtomicU64::new(0);
+
+    let mut items: Vec<(String, TokenFrequency, u64)> = files
+        .par_iter()
+        .map(|(key, path)| {
+            let res: Result<(String, TokenFrequency, u64), ()> = (|| {
+                let text = match std::fs::read_to_string(path) {
+                    Ok(t) => t,
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                        skipped_non_utf8.fetch_add(1, Ordering::Relaxed);
+                        return Err(());
+                    }
+                    Err(_) => {
+                        skipped_io.fetch_add(1, Ordering::Relaxed);
+                        return Err(());
+                    }
+                };
+                let (tokens, token_sum) = tokenizer
+                    .mix_doc_tokenizer(&text)
+                    .map_err(|_| ())?;
+                let mut freq = TokenFrequency::new();
+                freq.add_tokens(&tokens);
+                Ok((key.clone(), freq, token_sum))
+            })();
+            pb.inc(1);
+            res
+        })
+        .filter_map(|res| res.ok())
+        .collect();
+
+    pb.finish_and_clear();
+
+    // Keep deterministic build order (useful for debugging/reproducibility).
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut total_tokens: u64 = 0;
+    for (key, freq, token_sum) in items {
+        indexer.vectorizer.add_doc(key, &freq);
+        total_tokens = total_tokens.saturating_add(token_sum);
+    }
+
+    indexer.save_to(index_dir)?;
+
+    let elapsed = started.elapsed().as_secs_f64().max(0.000_001);
+    let docs_indexed = indexer.corpus.get_doc_num() as f64;
+    let docs_per_sec = docs_indexed / elapsed;
+    let tokens_per_sec = (total_tokens as f64) / elapsed;
+    eprintln!(
+        "Done. docs={} tokens={} skipped_non_utf8={} skipped_io={} elapsed={:.2}s docs/s={:.2} tokens/s={:.2}",
+        docs_indexed as u64,
+        total_tokens,
+        skipped_non_utf8.load(Ordering::Relaxed),
+        skipped_io.load(Ordering::Relaxed),
+        elapsed,
+        docs_per_sec,
+        tokens_per_sec
+    );
+    Ok(())
+}
+
+fn run_search(index_dir: &Path, query: &str, top: usize) -> Result<(), DynError> {
+    let mut indexer = DocIndexer::load_from(index_dir)?;
+    let results = indexer.search_doc(query)?;
+
+    for (rank, (key, score, doc_len)) in results.list.into_iter().take(top).enumerate() {
+        println!("{}\t{:.6}\t{}\t{}", rank + 1, score, doc_len, key);
+    }
+
+    Ok(())
+}
+
+fn collect_doc_files(root: &Path) -> Result<Vec<(String, PathBuf)>, DynError> {
+    let meta = std::fs::metadata(root)?;
+    if meta.is_file() {
+        let key = root
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| root.to_string_lossy().to_string());
+        return Ok(vec![(key, root.to_path_buf())]);
+    }
+
+    let mut out = Vec::new();
+
+    let walker = WalkDir::new(root).follow_links(false).into_iter().filter_entry(|e| {
+        // Avoid indexing build artifacts / repo metadata by default.
+        // (This mainly matters when users pass something like `--docs ./`.)
+        let Some(name) = e.file_name().to_str() else {
+            return true;
+        };
+        !matches!(name, "target" | ".git" | "index")
+    });
+
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if !entry.file_type().is_file() {
+            continue;
         }
+        let path = entry.path().to_path_buf();
+        let rel = match path.strip_prefix(root) {
+            Ok(p) => p,
+            Err(_) => path.as_path(),
+        };
+        let key = rel.to_string_lossy().replace('\\', "/");
+        out.push((key, path));
+    }
+
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+pub struct DocIndexer {
+    pub corpus: Arc<Corpus>,
+    pub vectorizer: TFIDFVectorizer<u16>,
+    pub tokenizer: SudachiTokenizer,
+}
+
+impl DocIndexer {
+    pub fn new() -> Self {
+        let corpus = Arc::new(Corpus::new());
+        let vectorizer = TFIDFVectorizer::new(corpus.clone());
+        let tokenizer = SudachiTokenizer::new().unwrap();
+        DocIndexer { corpus, vectorizer, tokenizer }
+    }
+
+    pub fn save_to(&self, index_dir: &Path) -> Result<(), DynError> {
+        std::fs::create_dir_all(index_dir)?;
+        let corpus = std::fs::File::create(index_dir.join("corpus.cbor"))?;
+        let vector = std::fs::File::create(index_dir.join("vector.cbor"))?;
+        ciborium::into_writer(&*self.corpus, corpus)?;
+        ciborium::into_writer(&self.vectorizer, vector)?;
+        Ok(())
+    }
+
+    pub fn load_from(index_dir: &Path) -> Result<Self, DynError> {
+        let corpus_file = std::fs::File::open(index_dir.join("corpus.cbor"))?;
+        let vector_file = std::fs::File::open(index_dir.join("vector.cbor"))?;
+        let corpus: Corpus = ciborium::from_reader(corpus_file)?;
+        let corpus = Arc::new(corpus);
+        let vectorizer: TFIDFData<u16> = ciborium::from_reader(vector_file)?;
+        let vectorizer = vectorizer.into_tf_idf_vectorizer(corpus.clone());
+        let tokenizer = SudachiTokenizer::new()?;
+        Ok(DocIndexer { corpus, vectorizer, tokenizer })
+    }
+
+    pub fn query_to_freq(&self, query: &str) -> Result<TokenFrequency, DynError> {
+        let tokenized = self.tokenizer.mix_query_tokenizer(query)?;
+        let mut freq = TokenFrequency::new();
+        freq.add_tokens(&tokenized);
+        Ok(freq)
+    }
+
+    pub fn doc_to_freq(&self, doc: &str) -> Result<(TokenFrequency, u64), DynError> {
+        let (tokenized, token_sum) = self.tokenizer.mix_doc_tokenizer(doc)?;
+        let mut freq = TokenFrequency::new();
+        freq.add_tokens(&tokenized);
+        Ok((freq, token_sum))
+    }
+
+    pub fn add_document(&mut self, doc: &str, key: &str) -> Result<u64, DynError> {
+        let (freq, token_sum) = self.doc_to_freq(doc)?;
+        self.vectorizer.add_doc(key.to_string(), &freq);
+        Ok(token_sum)
+    }
+
+    pub fn search_doc(&mut self, query: &str) -> Result<Hits<String>, DynError> {
+        let query_freq = self.query_to_freq(query)?;
+        let mut results = self.vectorizer.similarity(&query_freq, &SimilarityAlgorithm::CosineSimilarity);
+        results.sort_by_score();
+        Ok(results)
     }
 }

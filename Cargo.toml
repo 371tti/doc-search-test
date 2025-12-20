@@ -6,5 +6,14 @@ edition = "2024"
 [dependencies]
 rayon = "1.11.0"
 serde = { version = "1.0", features = ["derive", "rc"] }
-serde_cbor = "0.11.2"
-tf-idf-vectorizer = "0.4.6"
+ciborium = "0.2"
+tf-idf-vectorizer = "0.6.0"
+sudachi =  { git = "https://github.com/sorami/sudachi.rs.git", tag = "v0.6.10" }
+clap = { version = "4.5.23", features = ["derive"] }
+walkdir = "2.5.0"
+indicatif = "0.17"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
