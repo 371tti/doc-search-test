@@ -27,66 +27,58 @@ impl SudachiTokenizer {
     }
 
     pub fn tokenize(&self, text: &str, mode: Mode) -> Result<Tokenized, Box<dyn std::error::Error + Send + Sync>> {
-        const MAX_CHUNK_CHARS: usize = 2000;
+        // 文字数じゃなくバイトで切る（UTF-8デコードの全走査を避ける）
+        const MAX_CHUNK_BYTES: usize = 16 * 1024; // 例: 16KB（調整してOK）
+        const DELIMS: &[u8] = b"\n\r"; // まずは改行だけを境界にすると速い（句読点までやるなら後述）
+
         let tokenizer = self.new_tokenizer();
 
         // 短ければそのまま
-        if text.chars().count() <= MAX_CHUNK_CHARS {
-            let result = tokenizer.tokenize(text, mode, false)?;
-            let mut vec = Vec::new();
-            vec.push(result);
-            return Ok(Tokenized { result: vec });
+        if text.len() <= MAX_CHUNK_BYTES {
+            let r = tokenizer.tokenize(text, mode, false)?;
+            return Ok(Tokenized { result: vec![r] });
         }
 
-        // 区切りに使う記号（改行含む）
-        let delimiters = "。．、？！.!?；;,，\n\r";
-        let mut aggregated = Vec::new();
-        let mut buffer = String::new();
-        let mut buffer_len = 0usize;
+        let bytes = text.as_bytes();
+        let mut out = Vec::new();
 
-        for segment in text.split_inclusive(|c| delimiters.contains(c)) {
-            let segment_len = segment.chars().count();
+        let mut start = 0usize;
+        while start < bytes.len() {
+            let mut end = (start + MAX_CHUNK_BYTES).min(bytes.len());
 
-            if buffer_len + segment_len > MAX_CHUNK_CHARS {
-                if !buffer.is_empty() {
-                    let chunk = tokenizer.tokenize(&buffer, mode, false)?;
-                    aggregated.push(chunk);
-                    buffer.clear();
-                    buffer_len = 0;
-                }
-
-                if segment_len > MAX_CHUNK_CHARS {
-                    let mut temp = String::new();
-                    let mut temp_len = 0usize;
-                    for ch in segment.chars() {
-                        temp.push(ch);
-                        temp_len += 1;
-                        if temp_len >= MAX_CHUNK_CHARS {
-                            let chunk = tokenizer.tokenize(&temp, mode, false)?;
-                            aggregated.push(chunk);
-                            temp.clear();
-                            temp_len = 0;
-                        }
-                    }
-                    if !temp.is_empty() {
-                        buffer.push_str(&temp);
-                        buffer_len = temp_len;
-                    }
-                    continue;
+            // UTF-8境界に合わせる
+            while end < bytes.len() && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end <= start {
+                // 極端に境界が合わないケースの保険
+                end = (start + 1).min(bytes.len());
+                while end < bytes.len() && !text.is_char_boundary(end) {
+                    end += 1;
                 }
             }
 
-            buffer.push_str(segment);
-            buffer_len += segment_len;
+            // できれば改行まで後退（軽い delimiter）
+            let mut cut = end;
+            let search_start = start.max(end.saturating_sub(MAX_CHUNK_BYTES));
+            for i in (search_start..end).rev() {
+                if DELIMS.contains(&bytes[i]) {
+                    cut = i + 1;
+                    break;
+                }
+            }
+
+            let chunk = &text[start..cut];
+            if !chunk.trim().is_empty() {
+                out.push(tokenizer.tokenize(chunk, mode, false)?);
+            }
+
+            start = cut;
         }
 
-        if !buffer.is_empty() {
-            let chunk = tokenizer.tokenize(&buffer, mode, false)?;
-            aggregated.push(chunk);
-        }
-
-        Ok(Tokenized { result: aggregated })
+        Ok(Tokenized { result: out })
     }
+
 
     // pub fn pure_doc_tokenizer(&self, text: &str) -> Result<Vec<Box<str>>, Box<dyn std::error::Error + Send + Sync>> {
     //     let c = self.tokenize(text, Mode::C)?;
