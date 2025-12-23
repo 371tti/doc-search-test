@@ -91,7 +91,7 @@ impl SudachiTokenizer {
         let mut c_tokens = c.tokens();
         let token_sum = c_tokens.len();
         let a_tokens = a.tokens();
-        c_tokens.sort();
+        c_tokens.sort_unstable();
         let c_tokens_sub: Vec<Box<str>> = a_tokens.iter()
             .filter(|t| !c_tokens.binary_search(*t).is_ok())
             .cloned()
@@ -102,6 +102,12 @@ impl SudachiTokenizer {
             .chain(a_speech_tokens.into_iter())
             .collect();
         Ok((synthetic_tokens, token_sum as u64))
+    }
+
+    pub fn pure_doc_tokenizer(&self, text: &str) -> Result<(Vec<Box<str>>, u64), Box<dyn std::error::Error + Send + Sync>> {
+        let c = self.tokenize(text, Mode::C)?;
+        let token_sum = c.tokens().len();
+        Ok((c.tokens(), token_sum as u64))
     }
 
     // pub fn pure_query_tokenizer(&self, text: &str) -> Result<Vec<Box<str>>, Box<dyn std::error::Error + Send + Sync>> {

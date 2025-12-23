@@ -3,5 +3,12 @@ mod indexer;
 pub mod tokenize;
 
 fn main() -> Result<(), indexer::DynError> {
-    cli::run()
+    let res = cli::run();
+    match res {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            Err(e)
+        }
+    }
 }

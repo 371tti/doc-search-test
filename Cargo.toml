@@ -4,16 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rayon = "1.11.0"
 serde = { version = "1.0", features = ["derive", "rc"] }
 ciborium = "0.2"
-tf-idf-vectorizer = "0.6.0"
+tf-idf-vectorizer = "0.7.8"
 sudachi =  { git = "https://github.com/sorami/sudachi.rs.git", tag = "v0.6.10" }
-clap = { version = "4.5.23", features = ["derive"] }
-walkdir = "2.5.0"
-indicatif = "0.17"
+indicatif = "0.18.3"
+flume = "0.12.0"
+jwalk = "0.8"
+clap = { version = "4.3", features = ["derive"] }
+half = { version = "2.7.1", features = ["serde", "bytemuck"] }
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
+
