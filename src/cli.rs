@@ -162,7 +162,7 @@ fn run_shell(index_dir: &Path, top: usize) -> Result<(), DynError> {
         };
         
         results.top_k(top);
-        println!("results: {}", results);
+        println!("results: \n{}", results);
     }
 
     Ok(())

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use half::f16;
 use indicatif::{HumanBytes, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use jwalk::WalkDir;
-use tf_idf_vectorizer::{Corpus, Hits, SimilarityAlgorithm, TFIDFData, TFIDFVectorizer, TokenFrequency};
+use tf_idf_vectorizer::{Corpus, Hits, Query, SimilarityAlgorithm, TFIDFData, TFIDFVectorizer, TokenFrequency};
 
 use crate::tokenize::SudachiTokenizer;
 
@@ -25,10 +25,10 @@ const QUEUE_CAPACITY: usize = 1024;
 pub struct Queues {
     pub file_reader_sender: flume::Sender<PathBuf>,
     pub file_reader_receiver: flume::Receiver<PathBuf>,
-    pub tokenize_sender: flume::Sender<WithKey<String>>,
-    pub tokenize_receiver: flume::Receiver<WithKey<String>>,
-    pub vectorize_sender: flume::Sender<WithKey<(Vec<Box<str>>, u64)>>,
-    pub vectorize_receiver: flume::Receiver<WithKey<(Vec<Box<str>>, u64)>>,
+    pub tokenize_sender: flume::Sender<WithKey<Vec<u8>>>,
+    pub tokenize_receiver: flume::Receiver<WithKey<Vec<u8>>>,
+    pub vectorize_sender: flume::Sender<WithKey<TokenFrequency>>,
+    pub vectorize_receiver: flume::Receiver<WithKey<TokenFrequency>>,
 }
 
 #[derive(Default)]
@@ -37,16 +37,19 @@ pub struct PipelineStats {
     pub paths_sent: AtomicU64,
 
     // read stage
+    pub read_committed: AtomicU64,
     pub read_ok: AtomicU64,
     pub read_err: AtomicU64,
     pub utf8_err: AtomicU64,
     pub bytes_read: AtomicU64,
 
     // tokenize stage
+    pub tokenize_committed: AtomicU64,
     pub tok_ok: AtomicU64,
     pub tok_err: AtomicU64,
 
     // index stage
+    pub index_committed: AtomicU64,
     pub docs_added: AtomicU64,
 }
 
@@ -150,7 +153,11 @@ impl DocIndexer {
         let sender = queues.tokenize_sender.clone();
         std::thread::spawn(move || {
             while let Ok(path) = receiver.recv() {
-                let key = path.to_string_lossy().into_owned();
+                stats.read_committed.fetch_add(1, Ordering::Relaxed);
+                let key = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
 
                 let bytes = match std::fs::read(&path) {
                     Ok(b) => b,
@@ -158,12 +165,7 @@ impl DocIndexer {
                 };
                 stats.bytes_read.fetch_add(bytes.len() as u64, Ordering::Relaxed);
 
-                let content = match std::str::from_utf8(&bytes) {
-                    Ok(s) => s,
-                    Err(_) => { stats.utf8_err.fetch_add(1, Ordering::Relaxed); continue; }
-                };
-
-                if sender.send(WithKey { key, value: content.to_owned() }).is_err() {
+                if sender.send(WithKey { key, value: bytes }).is_err() {
                     return;
                 }
                 stats.read_ok.fetch_add(1, Ordering::Relaxed);
@@ -177,11 +179,17 @@ impl DocIndexer {
         let tokenizer = self.tokenizer.clone();
         std::thread::spawn(move || {
             while let Ok(text) = receiver.recv() {
-                let tokenized = match tokenizer.mix_doc_tokenizer(&text.value) {
+                stats.tokenize_committed.fetch_add(1, Ordering::Relaxed);
+                let s = match std::str::from_utf8(&text.value) {
+                    Ok(s) => s,
+                    Err(_) => { stats.utf8_err.fetch_add(1, Ordering::Relaxed); continue; }
+                };
+                let tokenized = match tokenizer.mix_doc_tokenizer(&s) {
                     Ok(t) => t,
                     Err(_) => { stats.tok_err.fetch_add(1, Ordering::Relaxed); continue; }
                 };
-                if sender.send(WithKey { key: text.key, value: tokenized }).is_err() {
+                let freq = TokenFrequency::from(tokenized.0.as_slice());
+                if sender.send(WithKey { key: text.key, value: freq }).is_err() {
                     return;
                 }
                 stats.tok_ok.fetch_add(1, Ordering::Relaxed);
@@ -192,11 +200,11 @@ impl DocIndexer {
     fn spawn_metrics_thread(stats: Arc<PipelineStats>, total_files: u64) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let pb = ProgressBar::new(total_files);
-            pb.set_draw_target(ProgressDrawTarget::stderr_with_hz(8));
+            pb.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
             pb.set_style(
                 ProgressStyle::with_template(
                     "{spinner:.green} [{elapsed_precise}] {wide_bar:.cyan/blue} {pos}/{len} ({percent}%) \
-                    idx {per_sec} ETA {eta_precise}\n{msg}"
+                    idx {per_sec:0} ETA {eta_precise}\n{msg}"
                 )
                 .unwrap()
                 .progress_chars("#>-")
@@ -206,7 +214,6 @@ impl DocIndexer {
             );
             pb.enable_steady_tick(Duration::from_millis(120));
 
-            let start = Instant::now();
             let mut last = Instant::now();
             let mut last_read_ok = 0u64;
             let mut last_tok_ok  = 0u64;
@@ -214,7 +221,7 @@ impl DocIndexer {
             let mut last_bytes   = 0u64;
 
             loop {
-                std::thread::sleep(Duration::from_millis(500));
+                std::thread::sleep(Duration::from_millis(200));
 
                 let read_ok = stats.read_ok.load(Ordering::Relaxed);
                 let tok_ok  = stats.tok_ok.load(Ordering::Relaxed);
@@ -224,6 +231,12 @@ impl DocIndexer {
                 let read_err = stats.read_err.load(Ordering::Relaxed);
                 let utf8_err = stats.utf8_err.load(Ordering::Relaxed);
                 let tok_err  = stats.tok_err.load(Ordering::Relaxed);
+
+                let read_committed = stats.read_committed.load(Ordering::Relaxed);
+                let tokenize_committed = stats.tokenize_committed.load(Ordering::Relaxed);
+                let index_committed = stats.index_committed.load(Ordering::Relaxed);
+
+                let paths_sent = stats.paths_sent.load(Ordering::Relaxed);
 
                 // progress は “最終成果物” (= added) に合わせるのが正確
                 pb.set_position(added.min(total_files));
@@ -240,22 +253,26 @@ impl DocIndexer {
                 last_added   = added;
                 last_bytes   = bytes;
 
+                let read_queue_len = paths_sent.saturating_sub(read_committed);
+                let tok_queue_len = (read_ok).saturating_sub(tokenize_committed);
+                let index_queue_len = (tok_ok).saturating_sub(index_committed);
+                let seen = paths_sent;
+
                 pb.set_message(format!(
-                    "read:  {:>8.1} files/s  ({read_ok} ok, {read_err} err, {utf8_err} utf8)\n\
-                    tok:   {:>8.1} docs/s   ({tok_ok} ok, {tok_err} err)\n\
-                    index: {:>8.1} docs/s   ({added} added)\n\
-                    io:    {:>8.1} MiB/s    (total {:.1} GiB)\n\
-                    uptime: {:?}",
+                    "io:    {:>8.1} MiB/s    (total {:.1} GiB)\n\
+                    ↓ read:  {:>8.1} files/s  ({read_ok} ok, {read_err} err, {utf8_err} utf8, {read_queue_len} wait)\n\
+                    ↓ tok:   {:>8.1} docs/s   ({tok_ok} ok, {tok_err} err, {tok_queue_len} wait)\n\
+                    ↓ index: {:>8.1} docs/s   ({added} added, {index_queue_len} wait)\n\
+                    Ram\n",
+                    mbps,
+                    bytes as f64 / (1024.0 * 1024.0 * 1024.0),
                     read_rps,
                     tok_rps,
                     add_rps,
-                    mbps,
-                    bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                    start.elapsed(),
                 ));
 
                 // すべて追加し終わったら終了
-                if added >= total_files {
+                if seen >= total_files as u64 && index_queue_len == 0 {
                     pb.finish_with_message("done");
                     break;
                 }
@@ -295,14 +312,14 @@ impl DocIndexer {
         let path_collector_handle = DocIndexer::spawn_path_collector_thread(path.to_path_buf(), &queues, stats.clone());
 
         // ファイルリーダースレッドを複数立てる
-        let file_reader_threads = 8; // 必要に応じて数を調整
+        let file_reader_threads = 6;
         let mut file_reader_handles = Vec::with_capacity(file_reader_threads);
         for _ in 0..file_reader_threads {
             file_reader_handles.push(DocIndexer::spawm_file_reader_thread(&queues, stats.clone()));
         }
 
         // トークナイズスレッドを複数立てる
-        let tokenize_threads = 16; // 必要に応じて数を調整
+        let tokenize_threads = 32;
         let mut tokenize_handles = Vec::with_capacity(tokenize_threads);
         for _ in 0..tokenize_threads {
             tokenize_handles.push(self.spawn_tokenize_thread(&queues, stats.clone()));
@@ -312,9 +329,9 @@ impl DocIndexer {
         drop(queues.tokenize_sender);
         drop(queues.vectorize_sender);
 
-        for WithKey { key, value: (tokens, _token_num) } in queues.vectorize_receiver.iter() {
-            let doc = TokenFrequency::from(tokens.as_slice());
-            self.vectorizer.add_doc(key, &doc);
+        for WithKey { key, value: freq } in queues.vectorize_receiver.iter() {
+            stats.index_committed.fetch_add(1, Ordering::Relaxed);
+            self.vectorizer.add_doc(key, &freq);
             stats.docs_added.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -442,21 +459,240 @@ impl DocIndexer {
         Ok(DocIndexer { corpus, vectorizer, tokenizer })
     }
 
-    pub fn query_to_freq(&self, query: &str) -> Result<TokenFrequency, DynError> {
-        let tokenized  = self.tokenizer.pure_doc_tokenizer(query)?;
-        println!("Query tokens: {:?}", tokenized);
-        let mut freq = TokenFrequency::new();
-        freq.add_tokens(&tokenized.0);
-        Ok(freq)
-    }
-
+    /// # Query format
+    /// key_word:
+    /// - &: AND
+    /// - |: OR
+    /// - !: NOT
+    /// - []: group
+    /// 
+    /// example:
+    /// "[rust & tf-idf | tokenizer] & !game"
+    /// to
+    /// let query = Query::and(Query::or(Query::and(Query::token("rust"), Query::token("tf-idf")), Query::token("tokenizer")), Query::not(Query::token("game")));
     pub fn search_doc(&mut self, query: &str, algorithm: SimilarityAlgorithm) -> Result<Hits<String>, DynError> {
         let inst = std::time::Instant::now();
-        let query_freq = self.query_to_freq(query)?;
-        let mut results = self.vectorizer.similarity(&query_freq, &algorithm);
+
+        let query = QueryBuilder::new(query).build()?;
+
+        let mut results = self.vectorizer.search(&algorithm, query);
         results.sort_by_score_desc();
         let elapsed = inst.elapsed().as_millis();
         println!("Found {} results in {} ms.", results.list.len(), elapsed);
         Ok(results)
+    }
+
+
+}
+#[derive(Debug, Clone)]
+pub struct QueryBuilder {
+    tokens: Vec<QueryToken>,
+    pos: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QueryToken {
+    LBracket,
+    RBracket,
+    And,
+    Or,
+    Not,
+    Word(String),
+}
+
+#[derive(Debug)]
+struct QueryParseError(String);
+
+impl std::fmt::Display for QueryParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Query parse error: {}", self.0)
+    }
+}
+
+impl std::error::Error for QueryParseError {}
+
+impl QueryBuilder {
+    pub fn new(query: &str) -> Self {
+        Self {
+            tokens: Self::tokenize(query),
+            pos: 0,
+        }
+    }
+
+    /// Parse the query string into `tf_idf_vectorizer::Query`.
+    ///
+    /// Supported:
+    /// - `&` AND
+    /// - `|` OR
+    /// - `!` NOT (prefix)
+    /// - `[...]` grouping
+    ///
+    /// Also supported:
+    /// - whitespace between terms is treated as AND
+    ///   e.g. `[token0 token1]` == `[token0 & token1]`
+    ///
+    /// Precedence: `!` > (implicit/explicit `&`) > `|`
+    pub fn build(mut self) -> Result<Query, DynError> {
+        if self.tokens.is_empty() {
+            return Ok(Query::none());
+        }
+
+        let q = self.parse_or()?;
+
+        if self.pos != self.tokens.len() {
+            return Err(Box::new(QueryParseError(format!(
+                "unexpected token at end: {:?}",
+                self.tokens.get(self.pos)
+            ))));
+        }
+
+        Ok(q)
+    }
+
+    fn tokenize(query: &str) -> Vec<QueryToken> {
+        let mut out = Vec::new();
+        let mut buf = String::new();
+
+        let flush_word = |out: &mut Vec<QueryToken>, buf: &mut String| {
+            if !buf.is_empty() {
+                out.push(QueryToken::Word(std::mem::take(buf)));
+            }
+        };
+
+        for ch in query.chars() {
+            match ch {
+                // whitespace ends a word (implicit AND is handled in parsing)
+                c if c.is_whitespace() => {
+                    flush_word(&mut out, &mut buf);
+                }
+                '[' => {
+                    flush_word(&mut out, &mut buf);
+                    out.push(QueryToken::LBracket);
+                }
+                ']' => {
+                    flush_word(&mut out, &mut buf);
+                    out.push(QueryToken::RBracket);
+                }
+                '&' => {
+                    flush_word(&mut out, &mut buf);
+                    out.push(QueryToken::And);
+                }
+                '|' => {
+                    flush_word(&mut out, &mut buf);
+                    out.push(QueryToken::Or);
+                }
+                '!' => {
+                    flush_word(&mut out, &mut buf);
+                    out.push(QueryToken::Not);
+                }
+                _ => buf.push(ch),
+            }
+        }
+
+        flush_word(&mut out, &mut buf);
+        out
+    }
+
+    fn peek(&self) -> Option<&QueryToken> {
+        self.tokens.get(self.pos)
+    }
+
+    fn next(&mut self) -> Option<QueryToken> {
+        let t = self.tokens.get(self.pos).cloned();
+        if t.is_some() {
+            self.pos += 1;
+        }
+        t
+    }
+
+    fn expect(&mut self, want: QueryToken) -> Result<(), DynError> {
+        let got = self.next();
+        if got.as_ref() == Some(&want) {
+            Ok(())
+        } else {
+            Err(Box::new(QueryParseError(format!(
+                "expected {:?}, got {:?}",
+                want, got
+            ))))
+        }
+    }
+
+    // Lowest precedence
+    fn parse_or(&mut self) -> Result<Query, DynError> {
+        let mut left = self.parse_and()?;
+        while matches!(self.peek(), Some(QueryToken::Or)) {
+            self.next();
+            let right = self.parse_and()?;
+            left = Query::or(left, right);
+        }
+        Ok(left)
+    }
+
+    // AND precedence (explicit '&' or implicit by whitespace / adjacency)
+    fn parse_and(&mut self) -> Result<Query, DynError> {
+        let mut left = self.parse_not()?;
+
+        loop {
+            match self.peek() {
+                Some(QueryToken::And) => {
+                    self.next(); // explicit AND
+                    let right = self.parse_not()?;
+                    left = Query::and(left, right);
+                }
+                // implicit AND: next token starts an expression
+                Some(QueryToken::Word(_)) | Some(QueryToken::LBracket) | Some(QueryToken::Not) => {
+                    let right = self.parse_not()?;
+                    left = Query::and(left, right);
+                }
+                _ => break,
+            }
+        }
+
+        Ok(left)
+    }
+
+    // Highest precedence (prefix unary)
+    fn parse_not(&mut self) -> Result<Query, DynError> {
+        if matches!(self.peek(), Some(QueryToken::Not)) {
+            self.next();
+            let inner = self.parse_not()?;
+            Ok(Query::not(inner))
+        } else {
+            self.parse_primary()
+        }
+    }
+
+    fn parse_primary(&mut self) -> Result<Query, DynError> {
+        match self.next() {
+            Some(QueryToken::Word(mut w)) => {
+                // allow quoted tokens: "token" or 'token'
+                if w.len() >= 2 {
+                    let bytes = w.as_bytes();
+                    let first = bytes[0];
+                    let last = bytes[bytes.len() - 1];
+                    if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+                        w = w[1..w.len() - 1].to_string();
+                    }
+                }
+
+                if w.is_empty() {
+                    Ok(Query::none())
+                } else if w == "*" {
+                    Ok(Query::all())
+                } else {
+                    Ok(Query::token(&w))
+                }
+            }
+            Some(QueryToken::LBracket) => {
+                let inner = self.parse_or()?;
+                self.expect(QueryToken::RBracket)?;
+                Ok(inner)
+            }
+            Some(tok) => Err(Box::new(QueryParseError(format!(
+                "unexpected token: {:?}",
+                tok
+            )))),
+            None => Ok(Query::none()),
+        }
     }
 }
