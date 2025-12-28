@@ -7,13 +7,25 @@ tf-idf-vectorizer のテスト用リポジトリですよん。
 このプロジェクトは Rust 製の tf-idf-vectorizer libの動作検証・テストを目的・ベンチマークとしています。
 
 - Sudachi による日本語トークン化対応
-- TF-IDF/BM25 による類似文書検索
+- 類似文書検索
 - コーパス・インデックスの保存/読込
-- 並列・ストリーム処理による高速インデックス構築
+- 並列・ストリーム処理による高速インデックス構築 (600doc/sec くらい)
 
 ## 使い方
 
-sudachi cli をインストールしといて辞書もぶっこんどいてください。
+実行ディレクトリにsudachiの設定と辞書を配置してください。
+配置例（実行ディレクトリ直下）:
+
+eg. 
+```text
+.
+└─ config/
+    ├─ sudachi.json
+    ├─ char.def
+    ├─ rewrite.def
+    ├─ system.dic
+    └─ unk.def
+```
 
 1. 必須: 文書ディレクトリを用意し、`--docs DIR` で指定してください。
 2. Sudachi コマンドが必要な場合は `--sudachi CMD` で指定できます。
@@ -21,11 +33,18 @@ sudachi cli をインストールしといて辞書もぶっこんどいてく�
 
 詳細なオプションは `cargo run --release -- -h` で確認できます。
 
-## 例
+んで
 
 ```sh
-cargo run --release -- --docs ./data/ex_docs --query "検索したい文章"
+cargo run --release -- --help
 ```
+
+# Query format
+key_word:
+- &: AND
+- |: OR
+- !: NOT
+- []: group
 
 ## 注意
 

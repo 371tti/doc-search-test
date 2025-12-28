@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use half::f16;
 use indicatif::{HumanBytes, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use jwalk::WalkDir;
-use tf_idf_vectorizer::{Corpus, Hits, Query, SimilarityAlgorithm, TFIDFData, TFIDFVectorizer, TokenFrequency};
+use tf_idf_vectorizer::{Corpus, Hits, Query, SimilarityAlgorithm, TFIDFData, TFIDFVectorizer, TermFrequency};
 
 use crate::tokenize::SudachiTokenizer;
 
@@ -27,8 +27,8 @@ pub struct Queues {
     pub file_reader_receiver: flume::Receiver<PathBuf>,
     pub tokenize_sender: flume::Sender<WithKey<Vec<u8>>>,
     pub tokenize_receiver: flume::Receiver<WithKey<Vec<u8>>>,
-    pub vectorize_sender: flume::Sender<WithKey<TokenFrequency>>,
-    pub vectorize_receiver: flume::Receiver<WithKey<TokenFrequency>>,
+    pub vectorize_sender: flume::Sender<WithKey<TermFrequency>>,
+    pub vectorize_receiver: flume::Receiver<WithKey<TermFrequency>>,
 }
 
 #[derive(Default)]
@@ -188,7 +188,7 @@ impl DocIndexer {
                     Ok(t) => t,
                     Err(_) => { stats.tok_err.fetch_add(1, Ordering::Relaxed); continue; }
                 };
-                let freq = TokenFrequency::from(tokenized.0.as_slice());
+                let freq = TermFrequency::from(tokenized.0.as_slice());
                 if sender.send(WithKey { key: text.key, value: freq }).is_err() {
                     return;
                 }
@@ -451,8 +451,8 @@ impl DocIndexer {
         let vectorizer = vectorizer.into_tf_idf_vectorizer(corpus.clone());
         let doc_num = vectorizer.doc_num();
         let vocab_size = corpus.vocab_size();
-        let token_sample_dim_size = vectorizer.token_dim_rev_index.len();
-        let max_rev_idx_len = vectorizer.token_dim_rev_index.values().iter().map(|v| v.len()).max().unwrap_or(0);
+        let token_sample_dim_size = vectorizer.term_dim_rev_index.len();
+        let max_rev_idx_len = vectorizer.term_dim_rev_index.values().iter().map(|v| v.len()).max().unwrap_or(0);
         let tokenizer = SudachiTokenizer::new()?;
         let elapsed = inst.elapsed().as_millis();
         println!("{} documents loaded. Vocab size: {}. Token sample dim size: {}. Max rev idx len: {}. Done {} ms", doc_num, vocab_size, token_sample_dim_size, max_rev_idx_len, elapsed);
@@ -680,7 +680,7 @@ impl QueryBuilder {
                 } else if w == "*" {
                     Ok(Query::all())
                 } else {
-                    Ok(Query::token(&w))
+                    Ok(Query::term(&w))
                 }
             }
             Some(QueryToken::LBracket) => {

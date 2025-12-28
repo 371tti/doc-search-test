@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 serde = { version = "1.0", features = ["derive", "rc"] }
 ciborium = "0.2"
-tf-idf-vectorizer = "0.9.0"
+tf-idf-vectorizer = "0.10.0"
 sudachi =  { git = "https://github.com/sorami/sudachi.rs.git", tag = "v0.6.10" }
 indicatif = "0.18.3"
 flume = "0.12.0"
