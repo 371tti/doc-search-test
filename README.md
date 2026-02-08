@@ -2,6 +2,8 @@
 
 tf-idf-vectorizer のテスト用リポジトリですよん。
 
+[テスト結果はここ](https://github.com/371tti/tf-idf-vectorizer/blob/main/doc-search-test.md)
+
 ## 概要
 
 このプロジェクトは Rust 製の tf-idf-vectorizer libの動作検証・テストを目的・ベンチマークとしています。
